@@ -36,11 +36,20 @@ type {{ .StructName }} struct {
 	// Address is the MANDATORY address to connect to.
 	Address string
 
+	// DNSCache is the MANDATORY DNS cache.
+	DNSCache *DNSCache
+
 	// IDGenerator is the MANDATORY atomic int64 to generate task IDs.
 	IDGenerator *atomicx.Int64
 
 	// Logger is the MANDATORY logger to use.
 	Logger model.Logger
+
+	{{ if or (eq .Template "http") (eq .Template "https") }}
+	// Sema is the MANDATORY semaphore to allow just a single
+	// connection to perform the HTTP transaction.
+	Sema <-chan any
+	{{ end }}
 
 	// TestKeys is MANDATORY and contains the TestKeys.
 	TestKeys *TestKeys
@@ -59,13 +68,23 @@ type {{ .StructName }} struct {
 	// CookieJar contains the OPTIONAL cookie jar, used for redirects.
 	CookieJar http.CookieJar
 
-	{{ if or (eq .Template "http") (eq .Template "https") }}
-	// HostHeader is the OPTIONAL host header to use.
-	HostHeader string
 
 	{{ if or (eq .Template "tls") (eq .Template "https") }}
 	// SNI is the OPTIONAL SNI to use.
 	SNI string
+	{{ end }}
+
+	{{ if or (eq .Template "http") (eq .Template "https") }}
+	// HostHeader is the OPTIONAL host header to use.
+	HostHeader string
+
+	// FollowRedirects is OPTIONAL and instructs this flow
+	// to follow HTTP redirects (if any).
+	FollowRedirects bool
+
+	{{ if or (eq .Template "http") (eq .Template "https") }}
+	// Referer contains the OPTIONAL referer, used for redirects.
+	Referer string
 	{{ end }}
 
 	// URLPath is the OPTIONAL URL path.
@@ -74,6 +93,11 @@ type {{ .StructName }} struct {
 	// URLRawQuery is the OPTIONAL URL raw query.
 	URLRawQuery string
 	{{ end }}
+
+	// UDPAddress is the OPTIONAL address of the UDP resolver to use. If this
+	// field is not set we use a default one (e.g., `8.8.8.8:53`).
+	UDPAddress string
+
 }
 
 // Start starts this task in a background goroutine.
@@ -92,22 +116,31 @@ func (t *{{ .StructName }}) Run(parentCtx context.Context, index int64) {
 	trace := measurexlite.NewTrace(index, t.ZeroTime)
 
 	// start the operation logger
-	ol := measurexlite.NewOperationLogger(t.Logger, "{{ .StructName }}#%d", index) // TODO: edit
+	{{ if or (eq .Template "http") (eq .Template "https") }}
+	ol := measurexlite.NewOperationLogger(
+		t.Logger, "[#%d] GET {{ if eq .Template "http" }}http{{ else }}https{{ end }}://%s using %s", index, t.HostHeader, t.Address,
+	)
+	{{ else }}
+	ol := measurexlite.NewOperationLogger(
+		t.Logger, "[#%d] GET %s", index, t.Address,
+	)
+	{{ end }}
+
 
 	{{ if or (eq .Template "tcp") (eq .Template "tls") (eq .Template "https") (eq .Template "http") }}
 	// perform the TCP connect
-	const tcpTimeout = 10 * time.Second // TODO: consider changing
+	const tcpTimeout = 10 * time.Second
 	tcpCtx, tcpCancel := context.WithTimeout(parentCtx, tcpTimeout)
 	defer tcpCancel()
 	tcpDialer := trace.NewDialerWithoutResolver(t.Logger)
 	tcpConn, err := tcpDialer.DialContext(tcpCtx, "tcp", t.Address)
-	_ = <-trace.TCPConnect // TODO: save
+	t.TestKeys.AppendTCPConnectResults(trace.TCPConnects()...)
 	if err != nil {
 		ol.Stop(err)
 		return
 	}
 	defer func() {
-		_ = trace.NetworkEvents() // TODO: save
+		t.TestKeys.AppendNetworkEvents(trace.NetworkEvents()...)
 		tcpConn.Close()
 	}()
 	{{ end }}
@@ -126,11 +159,11 @@ func (t *{{ .StructName }}) Run(parentCtx context.Context, index int64) {
 		RootCAs:    netxlite.NewDefaultCertPool(),
 		ServerName: tlsSNI,
 	}
-	const tlsTimeout = 10 * time.Second // TODO: consider changing
+	const tlsTimeout = 10 * time.Second
 	tlsCtx, tlsCancel := context.WithTimeout(parentCtx, tlsTimeout)
 	defer tlsCancel()
 	tlsConn, tlsConnState, err := tlsHandshaker.Handshake(tlsCtx, tcpConn, tlsConfig)
-	_ = <-trace.TLSHandshake // TODO: save
+	t.TestKeys.AppendTLSHandshakes(trace.TLSHandshakes()...)
 	if err != nil {
 		ol.Stop(err)
 		return
@@ -139,6 +172,16 @@ func (t *{{ .StructName }}) Run(parentCtx context.Context, index int64) {
 	alpn := tlsConnState.NegotiatedProtocol
 	{{ else }}
 	alpn := "" // no ALPN because we're not using TLS
+	{{ end }}
+
+	{{ if or (eq .Template "http") (eq .Template "https") }}
+	// Only allow N flows to _use_ the connection
+	select {
+	case <-t.Sema:
+	default:
+		ol.Stop(nil)
+		return
+	}
 	{{ end }}
 
 	{{ if eq .Template "http" }}
@@ -160,12 +203,18 @@ func (t *{{ .StructName }}) Run(parentCtx context.Context, index int64) {
 
 	{{ if or (eq .Template "http") (eq .Template "https") }}
 	// create HTTP request
-	const httpTimeout = 10 * time.Second // TODO: consider changing
+	const httpTimeout = 10 * time.Second
 	httpCtx, httpCancel := context.WithTimeout(parentCtx, httpTimeout)
 	defer httpCancel()
 	httpReq, err := t.newHTTPRequest(httpCtx)
 	if err != nil {
-		t.TestKeys.SetFundamentalFailure(err)
+		if t.Referer == "" {
+			// when the referer is empty, the failing URL comes from our backend
+			// or from the user, so it's a fundamental failure. After that, we
+			// are dealing with websites provided URLs, so we should not flag a
+			// fundamental failure, because we want to see the measurement submitted.
+			t.TestKeys.SetFundamentalFailure(err)
+		}
 		ol.Stop(err)
 		return
 	}
@@ -185,8 +234,10 @@ func (t *{{ .StructName }}) Run(parentCtx context.Context, index int64) {
 		return
 	}
 
+	// if enabled, follow possible redirects
+	t.maybeFollowRedirects(parentCtx, httpResp)
+
 	// TODO: insert here additional code if needed
-	_ = httpResp
 	_ = httpRespBody
 	{{ end }}
 
@@ -265,6 +316,7 @@ func (t *{{ .StructName }}) newHTTPRequest(ctx context.Context) (*http.Request, 
 	httpReq.Header.Set("Host", t.HostHeader)
 	httpReq.Header.Set("Accept", model.HTTPHeaderAccept)
 	httpReq.Header.Set("Accept-Language", model.HTTPHeaderAcceptLanguage)
+	httpReq.Header.Set("Referer", t.Referer)
 	httpReq.Header.Set("User-Agent", model.HTTPHeaderUserAgent)
 	httpReq.Host = t.HostHeader
 	if t.CookieJar != nil {
@@ -278,7 +330,7 @@ func (t *{{ .StructName }}) newHTTPRequest(ctx context.Context) (*http.Request, 
 // httpTransaction runs the HTTP transaction and saves the results.
 func (t *{{ .StructName }}) httpTransaction(ctx context.Context, network, address, alpn string,
 	txp model.HTTPTransport, req *http.Request, trace *measurexlite.Trace) (*http.Response, []byte, error) {
-	const maxbody = 1 << 19 // TODO: you may want to change this default
+	const maxbody = 1 << 19
 	started := trace.TimeSince(trace.ZeroTime)
 	resp, err := txp.RoundTrip(req)
 	var body []byte
@@ -305,7 +357,40 @@ func (t *{{ .StructName }}) httpTransaction(ctx context.Context, network, addres
 		err,
 		finished,
 	)
-	_ = ev // TODO: save
+	t.TestKeys.AppendRequests(ev)
 	return resp, body, err
+}
+
+// maybeFollowRedirects follows redirects if configured and needed
+func (t *{{ .StructName }}) maybeFollowRedirects(ctx context.Context, resp *http.Response) {
+	if !t.FollowRedirects {
+		return // not configured
+	}
+	switch resp.StatusCode {
+	case 301, 302, 307, 308:
+		location, err := resp.Location()
+		if err != nil {
+			return // broken response from server
+		}
+		t.Logger.Infof("redirect to: %s", location.String())
+		resolvers := &DNSResolvers{
+			CookieJar:   t.CookieJar,
+			DNSCache:    t.DNSCache,
+			Domain:      location.Hostname(),
+			IDGenerator: t.IDGenerator,
+			Logger:      t.Logger,
+			TestKeys:    t.TestKeys,
+			URL:         location,
+			ZeroTime:    t.ZeroTime,
+			WaitGroup:   t.WaitGroup,
+			Referer:     resp.Request.URL.String(),
+			Session:     nil, // no need to issue another control request
+			THAddr:      "",  // ditto
+			UDPAddress:  t.UDPAddress,
+		}
+		resolvers.Start(ctx)
+	default:
+		// no redirect to follow
+	}
 }
 {{ end }}

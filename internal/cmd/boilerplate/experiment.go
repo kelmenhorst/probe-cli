@@ -63,7 +63,8 @@ func (c *NewExperimentCommand) Run(*cobra.Command, []string) {
 		generateInputParserGo(info)
 	}
 
-	pkg := filepath.Join("internal", "experiment", info.Package(), "/...")
+	// TODO: why "/..." at the end?
+	pkg := filepath.Join("internal", "experiment", info.Package())
 	gofmt(pkg)
 
 	printf("\n")
