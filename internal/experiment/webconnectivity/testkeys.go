@@ -59,6 +59,9 @@ type TestKeys struct {
 	// TLSHandshakes contains TLS handshakes results.
 	TLSHandshakes []*model.ArchivalTLSOrQUICHandshakeResult `json:"tls_handshakes"`
 
+	// QUICHandshakes contains QUIC handshakes results.
+	QUICHandshakes []*model.ArchivalTLSOrQUICHandshakeResult `json:"quic_handshakes"`
+
 	// ControlRequest is the control request we sent.
 	ControlRequest *webconnectivity.ControlRequest `json:"x_control_request"`
 
@@ -237,6 +240,13 @@ func (tk *TestKeys) AppendTCPConnectResults(v ...*model.ArchivalTCPConnectResult
 func (tk *TestKeys) AppendTLSHandshakes(v ...*model.ArchivalTLSOrQUICHandshakeResult) {
 	tk.mu.Lock()
 	tk.TLSHandshakes = append(tk.TLSHandshakes, v...)
+	tk.mu.Unlock()
+}
+
+// AppendTLSHandshakes appends to TLSHandshakes.
+func (tk *TestKeys) AppendQUICHandshakes(v ...*model.ArchivalTLSOrQUICHandshakeResult) {
+	tk.mu.Lock()
+	tk.QUICHandshakes = append(tk.QUICHandshakes, v...)
 	tk.mu.Unlock()
 }
 

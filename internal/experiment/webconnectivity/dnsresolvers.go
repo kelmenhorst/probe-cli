@@ -496,6 +496,26 @@ func (t *DNSResolvers) startSecureFlows(
 			URLRawQuery:     t.URL.RawQuery,
 		}
 		task.Start(ctx)
+		taskH3 := &HTTP3Flow{
+			Address:         net.JoinHostPort(addr.Addr, port),
+			DNSCache:        t.DNSCache,
+			IDGenerator:     t.IDGenerator,
+			Logger:          t.Logger,
+			NumRedirects:    t.NumRedirects,
+			TestKeys:        t.TestKeys,
+			ZeroTime:        t.ZeroTime,
+			WaitGroup:       t.WaitGroup,
+			CookieJar:       t.CookieJar,
+			FollowRedirects: t.URL.Scheme == "https",
+			SNI:             t.URL.Hostname(),
+			HostHeader:      t.URL.Host,
+			PrioSelector:    ps,
+			Referer:         t.Referer,
+			UDPAddress:      t.UDPAddress,
+			URLPath:         t.URL.Path,
+			URLRawQuery:     t.URL.RawQuery,
+		}
+		taskH3.Start(ctx)
 	}
 }
 
