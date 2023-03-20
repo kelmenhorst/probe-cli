@@ -39,11 +39,8 @@ type Config struct {
 // Subresult contains the keys of a single measurement
 // that targets either the target or the control.
 type Subresult struct {
-	Failure       *string               `json:"failure"`
-	NetworkEvents []tracex.NetworkEvent `json:"network_events"`
-	// TODO: consider moving queries into TestKeys, as this is redundant
-	Queries       []tracex.DNSQueryEntry   `json:"queries"`
-	Requests      []tracex.RequestEntry    `json:"requests"`
+	Failure       *string                  `json:"failure"`
+	NetworkEvents []tracex.NetworkEvent    `json:"network_events"`
 	SNI           string                   `json:"sni"`
 	TCPConnect    []tracex.TCPConnectEntry `json:"tcp_connect"`
 	THAddress     string                   `json:"th_address"`
@@ -57,12 +54,6 @@ func (tk *Subresult) mergeObservations(obs []*dslx.Observations) {
 		for _, e := range o.NetworkEvents {
 			tk.NetworkEvents = append(tk.NetworkEvents, *e)
 		}
-		for _, e := range o.Queries {
-			tk.Queries = append(tk.Queries, *e)
-		}
-		for _, e := range o.Requests {
-			tk.Requests = append(tk.Requests, *e)
-		}
 		for _, e := range o.TCPConnect {
 			tk.TCPConnect = append(tk.TCPConnect, *e)
 		}
@@ -74,9 +65,10 @@ func (tk *Subresult) mergeObservations(obs []*dslx.Observations) {
 
 // TestKeys contains sniblocking test keys.
 type TestKeys struct {
-	Control Subresult `json:"control"`
-	Result  string    `json:"result"`
-	Target  Subresult `json:"target"`
+	Control Subresult              `json:"control"`
+	Queries []tracex.DNSQueryEntry `json:"queries"`
+	Result  string                 `json:"result"`
+	Target  Subresult              `json:"target"`
 }
 
 const (
@@ -121,9 +113,12 @@ func (tk *TestKeys) classify() string {
 
 // Measurer performs the measurement.
 type Measurer struct {
-	cache  map[string]Subresult
-	config Config
-	mu     sync.Mutex
+	thAddrs  *dslx.AddressSet
+	cache    map[string]Subresult
+	config   Config
+	mu       sync.Mutex
+	idGen    atomic.Int64
+	zeroTime time.Time
 }
 
 // ExperimentName implements ExperimentMeasurer.ExperiExperimentName.
@@ -136,11 +131,9 @@ func (m *Measurer) ExperimentVersion() string {
 	return testVersion
 }
 
-func lookupTH(
+func (m *Measurer) lookupTH(
 	thaddr string,
-	idGen *atomic.Int64,
 	logger model.Logger,
-	zeroTime time.Time,
 	resolverURL string,
 	ctx context.Context,
 ) *dslx.Maybe[*dslx.ResolvedAddresses] {
@@ -148,9 +141,9 @@ func lookupTH(
 	// describe the DNS measurement input
 	dnsInput := dslx.NewDomainToResolve(
 		dslx.DomainName(thaddrHost),
-		dslx.DNSLookupOptionIDGenerator(idGen),
+		dslx.DNSLookupOptionIDGenerator(&m.idGen),
 		dslx.DNSLookupOptionLogger(logger),
-		dslx.DNSLookupOptionZeroTime(zeroTime),
+		dslx.DNSLookupOptionZeroTime(m.zeroTime),
 	)
 	// construct resolver
 	lookup := dslx.DNSLookupGetaddrinfo()
@@ -165,7 +158,6 @@ func lookupTH(
 func (m *Measurer) measureone(
 	ctx context.Context,
 	sess model.ExperimentSession,
-	beginning time.Time,
 	sni string,
 	thaddr string,
 ) Subresult {
@@ -183,36 +175,14 @@ func (m *Measurer) measureone(
 		}
 	}
 
-	idGen := &atomic.Int64{}
-	zeroTime := time.Now()
-
-	// TODO: This DNS lookup is redundant, as it is done for both control and target SNI.
-	//		 However, the data format requires queries separately for each subresult.
-	dnsResult := lookupTH(thaddr, idGen, sess.Logger(), zeroTime, m.config.ResolverURL, ctx)
-
-	// create a subresult, extract and merge observations
-	subresult := Subresult{
-		SNI:       sni,
-		THAddress: thaddr,
-	}
-	subresult.mergeObservations(dslx.ExtractObservations(dnsResult))
-
-	// if the lookup has failed we return
-	if dnsResult.Error != nil {
-		return subresult
-	}
-
-	// obtain a unique set of IP addresses w/o bogons inside it
-	ipAddrs := dslx.NewAddressSet(dnsResult).RemoveBogons()
-
 	// create the set of endpoints
-	endpoints := ipAddrs.ToEndpoints(
+	endpoints := m.thAddrs.ToEndpoints(
 		dslx.EndpointNetwork("tcp"),
 		dslx.EndpointPort(443),
 		dslx.EndpointOptionDomain(thaddr),
-		dslx.EndpointOptionIDGenerator(idGen),
+		dslx.EndpointOptionIDGenerator(&m.idGen),
 		dslx.EndpointOptionLogger(sess.Logger()),
-		dslx.EndpointOptionZeroTime(zeroTime),
+		dslx.EndpointOptionZeroTime(m.zeroTime),
 	)
 
 	// create the established connections pool
@@ -236,9 +206,13 @@ func (m *Measurer) measureone(
 		),
 		dslx.StreamList(endpoints...),
 	)
-
 	coll := dslx.Collect(httpsResults)
 
+	// create a subresult
+	subresult := Subresult{
+		SNI:       sni,
+		THAddress: thaddr,
+	}
 	// extract and merge observations
 	subresult.mergeObservations(dslx.ExtractObservations(coll...))
 
@@ -247,7 +221,6 @@ func (m *Measurer) measureone(
 	if firstError != nil {
 		subresult.Failure = tracex.NewFailure(firstError)
 	}
-
 	return subresult
 }
 
@@ -257,7 +230,6 @@ func (m *Measurer) measureonewithcache(
 	ctx context.Context,
 	output chan<- Subresult,
 	sess model.ExperimentSession,
-	beginning time.Time,
 	sni string,
 	thaddr string,
 ) {
@@ -269,7 +241,7 @@ func (m *Measurer) measureonewithcache(
 		output <- smk
 		return
 	}
-	smk = m.measureone(ctx, sess, beginning, sni, thaddr)
+	smk = m.measureone(ctx, sess, sni, thaddr)
 	output <- smk
 	smk.Cached = true
 	m.mu.Lock()
@@ -283,11 +255,7 @@ func (m *Measurer) startall(
 ) <-chan Subresult {
 	outputs := make(chan Subresult, len(inputs))
 	for _, input := range inputs {
-		go m.measureonewithcache(
-			ctx, outputs, sess,
-			measurement.MeasurementStartTimeSaved,
-			input, m.config.TestHelperAddress,
-		)
+		go m.measureonewithcache(ctx, outputs, sess, input, m.config.TestHelperAddress)
 	}
 	return outputs
 }
@@ -298,16 +266,16 @@ func processall(
 	inputs []string,
 	sess model.ExperimentSession,
 	controlSNI string,
-) *TestKeys {
+	tk *TestKeys,
+) {
 	var (
-		current  int
-		testkeys = new(TestKeys)
+		current int
 	)
 	for smk := range outputs {
 		if smk.SNI == controlSNI {
-			testkeys.Control = smk
+			tk.Control = smk
 		} else if smk.SNI == string(measurement.Input) {
-			testkeys.Target = smk
+			tk.Target = smk
 		} else {
 			panic("unexpected smk.SNI")
 		}
@@ -319,9 +287,8 @@ func processall(
 			break
 		}
 	}
-	testkeys.Result = testkeys.classify()
-	sess.Logger().Infof("sni_blocking: result: %s", testkeys.Result)
-	return testkeys
+	tk.Result = tk.classify()
+	sess.Logger().Infof("sni_blocking: result: %s", tk.Result)
 }
 
 // maybeURLToSNI handles the case where the input is from the test-lists
@@ -339,13 +306,19 @@ func maybeURLToSNI(input model.MeasurementTarget) (model.MeasurementTarget, erro
 
 // Run implements ExperimentMeasurer.Run.
 func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
+	m.zeroTime = time.Now()
+	m.idGen = atomic.Int64{}
+
 	measurement := args.Measurement
+	tk := new(TestKeys)
+	measurement.TestKeys = tk
 	sess := args.Session
 	m.mu.Lock()
 	if m.cache == nil {
 		m.cache = make(map[string]Subresult)
 	}
 	m.mu.Unlock()
+
 	if m.config.ControlSNI == "" {
 		m.config.ControlSNI = "example.org"
 	}
@@ -358,11 +331,25 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 		)
 	}
 
-	// TODO(bassosimone): if the user has configured DoT or DoH, here we
-	// probably want to perform the name resolution before the measurements
-	// or to make sure that the classify logic is robust to that.
+	// Lookup testhelper address.
+	//
+	// TODO(bassosimone, kelmenhorst): allow the user to configure DoT or DoH,
+	// make sure that the classify logic is robust to that.
 	//
 	// See https://github.com/ooni/probe-engine/issues/392.
+	dnsResult := m.lookupTH(m.config.TestHelperAddress, sess.Logger(), m.config.ResolverURL, ctx)
+	for _, o := range dnsResult.Observations {
+		for _, e := range o.Queries {
+			tk.Queries = append(tk.Queries, *e)
+		}
+	}
+	// if the lookup of the testhelper address has failed, we cannot continue
+	if dnsResult.Error != nil {
+		tk.Result = classAnomalyTestHelperUnreachable
+		return nil
+	}
+	// obtain a unique set of IP addresses w/o bogons inside it
+	m.thAddrs = dslx.NewAddressSet(dnsResult).RemoveBogons()
 
 	maybeParsed, err := maybeURLToSNI(measurement.Input)
 	if err != nil {
@@ -375,10 +362,9 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second*time.Duration(len(inputs)))
 	defer cancel()
+
 	outputs := m.startall(ctx, sess, measurement, inputs)
-	measurement.TestKeys = processall(
-		outputs, measurement, inputs, sess, m.config.ControlSNI,
-	)
+	processall(outputs, measurement, inputs, sess, m.config.ControlSNI, tk)
 	return nil
 }
 
