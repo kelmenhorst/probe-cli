@@ -327,6 +327,10 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	if measurement.Input == "" {
 		return errors.New("Experiment requires measurement.Input")
 	}
+	maybeParsed, err := maybeURLToSNI(measurement.Input)
+	if err != nil {
+		return err
+	}
 	if m.config.TestHelperAddress == "" {
 		m.config.TestHelperAddress = net.JoinHostPort(
 			m.config.ControlSNI, "443",
@@ -359,10 +363,6 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	// obtain a unique set of IP addresses w/o bogons inside it
 	m.thAddrs = dslx.NewAddressSet(dnsResult).RemoveBogons()
 
-	maybeParsed, err := maybeURLToSNI(measurement.Input)
-	if err != nil {
-		return err
-	}
 	measurement.Input = maybeParsed
 	inputs := []string{m.config.ControlSNI}
 	if string(measurement.Input) != m.config.ControlSNI {
