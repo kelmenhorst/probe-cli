@@ -262,7 +262,6 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	defer cancel()
 	sess := args.Session
 	idGen := &atomic.Int64{}
-	zeroTime := time.Now()
 
 	tk := NewTestKeys()
 	tk.Agent = "redirect"
@@ -271,10 +270,10 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
-	go measureDC(ctx, sess, zeroTime, idGen, tk, wg)
+	go measureDC(ctx, sess, measurement.MeasurementStartTimeSaved, idGen, tk, wg)
 
 	wg.Add(1)
-	go measureWeb(ctx, sess, zeroTime, idGen, tk, wg)
+	go measureWeb(ctx, sess, measurement.MeasurementStartTimeSaved, idGen, tk, wg)
 
 	wg.Wait()
 	return nil

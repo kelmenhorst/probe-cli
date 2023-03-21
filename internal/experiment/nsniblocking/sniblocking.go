@@ -113,12 +113,11 @@ func (tk *TestKeys) classify() string {
 
 // Measurer performs the measurement.
 type Measurer struct {
-	thAddrs  *dslx.AddressSet
-	cache    map[string]Subresult
-	config   Config
-	mu       sync.Mutex
-	idGen    atomic.Int64
-	zeroTime time.Time
+	thAddrs *dslx.AddressSet
+	cache   map[string]Subresult
+	config  Config
+	mu      sync.Mutex
+	idGen   atomic.Int64
 }
 
 // ExperimentName implements ExperimentMeasurer.ExperiExperimentName.
@@ -132,10 +131,11 @@ func (m *Measurer) ExperimentVersion() string {
 }
 
 func (m *Measurer) lookupTH(
-	thaddr string,
-	logger model.Logger,
-	resolverURL string,
 	ctx context.Context,
+	logger model.Logger,
+	zeroTime time.Time,
+	resolverURL string,
+	thaddr string,
 ) *dslx.Maybe[*dslx.ResolvedAddresses] {
 	thaddrHost, _, _ := net.SplitHostPort(thaddr) // TODO: handle error?
 	// describe the DNS measurement input
@@ -143,7 +143,7 @@ func (m *Measurer) lookupTH(
 		dslx.DomainName(thaddrHost),
 		dslx.DNSLookupOptionIDGenerator(&m.idGen),
 		dslx.DNSLookupOptionLogger(logger),
-		dslx.DNSLookupOptionZeroTime(m.zeroTime),
+		dslx.DNSLookupOptionZeroTime(zeroTime),
 	)
 	// construct resolver
 	lookup := dslx.DNSLookupGetaddrinfo()
@@ -158,6 +158,7 @@ func (m *Measurer) lookupTH(
 func (m *Measurer) measureone(
 	ctx context.Context,
 	sess model.ExperimentSession,
+	zeroTime time.Time,
 	sni string,
 	thaddr string,
 ) Subresult {
@@ -182,7 +183,7 @@ func (m *Measurer) measureone(
 		dslx.EndpointOptionDomain(thaddr),
 		dslx.EndpointOptionIDGenerator(&m.idGen),
 		dslx.EndpointOptionLogger(sess.Logger()),
-		dslx.EndpointOptionZeroTime(m.zeroTime),
+		dslx.EndpointOptionZeroTime(zeroTime),
 	)
 
 	// create the established connections pool
@@ -230,6 +231,7 @@ func (m *Measurer) measureonewithcache(
 	ctx context.Context,
 	output chan<- Subresult,
 	sess model.ExperimentSession,
+	zeroTime time.Time,
 	sni string,
 	thaddr string,
 ) {
@@ -241,7 +243,7 @@ func (m *Measurer) measureonewithcache(
 		output <- smk
 		return
 	}
-	smk = m.measureone(ctx, sess, sni, thaddr)
+	smk = m.measureone(ctx, sess, zeroTime, sni, thaddr)
 	output <- smk
 	smk.Cached = true
 	m.mu.Lock()
@@ -250,12 +252,14 @@ func (m *Measurer) measureonewithcache(
 }
 
 func (m *Measurer) startall(
-	ctx context.Context, sess model.ExperimentSession,
-	measurement *model.Measurement, inputs []string,
+	ctx context.Context,
+	sess model.ExperimentSession,
+	zeroTime time.Time,
+	inputs []string,
 ) <-chan Subresult {
 	outputs := make(chan Subresult, len(inputs))
 	for _, input := range inputs {
-		go m.measureonewithcache(ctx, outputs, sess, input, m.config.TestHelperAddress)
+		go m.measureonewithcache(ctx, outputs, sess, zeroTime, input, m.config.TestHelperAddress)
 	}
 	return outputs
 }
@@ -306,9 +310,7 @@ func maybeURLToSNI(input model.MeasurementTarget) (model.MeasurementTarget, erro
 
 // Run implements ExperimentMeasurer.Run.
 func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
-	m.zeroTime = time.Now()
 	m.idGen = atomic.Int64{}
-
 	measurement := args.Measurement
 	tk := new(TestKeys)
 	measurement.TestKeys = tk
@@ -337,7 +339,13 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	// make sure that the classify logic is robust to that.
 	//
 	// See https://github.com/ooni/probe-engine/issues/392.
-	dnsResult := m.lookupTH(m.config.TestHelperAddress, sess.Logger(), m.config.ResolverURL, ctx)
+	dnsResult := m.lookupTH(
+		ctx,
+		sess.Logger(),
+		measurement.MeasurementStartTimeSaved,
+		m.config.ResolverURL,
+		m.config.TestHelperAddress,
+	)
 	for _, o := range dnsResult.Observations {
 		for _, e := range o.Queries {
 			tk.Queries = append(tk.Queries, *e)
@@ -363,7 +371,7 @@ func (m *Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second*time.Duration(len(inputs)))
 	defer cancel()
 
-	outputs := m.startall(ctx, sess, measurement, inputs)
+	outputs := m.startall(ctx, sess, measurement.MeasurementStartTimeSaved, inputs)
 	processall(outputs, measurement, inputs, sess, m.config.ControlSNI, tk)
 	return nil
 }
