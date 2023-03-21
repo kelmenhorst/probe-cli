@@ -164,6 +164,9 @@ type Measurer struct {
 	// Config contains the experiment settings. If empty we
 	// will be using default settings.
 	Config Config
+
+	idGen    *atomic.Int64
+	zeroTime time.Time
 }
 
 // ExperimentName implements ExperimentMeasurer.ExperimentName
@@ -178,12 +181,13 @@ func (m Measurer) ExperimentVersion() string {
 
 // Run implements ExperimentMeasurer.Run
 func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
+	m.zeroTime = time.Now()
+	m.idGen = &atomic.Int64{}
 	sess := args.Session
 	measurement := args.Measurement
 	tk := new(TestKeys)
 	measurement.TestKeys = tk
 
-	zeroTime := time.Now()
 	certPool, err := newCertPool()
 	if err != nil {
 		return err // fundamental error, let's not submit
@@ -203,7 +207,7 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	wg := &sync.WaitGroup{}
 	for _, domain := range domains {
 		wg.Add(1)
-		go measureTarget(ctx, sess.Logger(), &atomic.Int64{}, zeroTime, tk, domain, certPool, wg)
+		go m.measureTarget(ctx, sess.Logger(), tk, domain, certPool, wg)
 	}
 	wg.Wait()
 
@@ -211,11 +215,9 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 }
 
 // measureTarget measures a signal backend domain
-func measureTarget(
+func (m *Measurer) measureTarget(
 	ctx context.Context,
 	logger model.Logger,
-	idGen *atomic.Int64,
-	zeroTime time.Time,
 	tk *TestKeys,
 	domain string,
 	certPool *x509.CertPool,
@@ -226,9 +228,9 @@ func measureTarget(
 	// describe the DNS measurement input
 	dnsInput := dslx.NewDomainToResolve(
 		dslx.DomainName(domain),
-		dslx.DNSLookupOptionIDGenerator(idGen),
+		dslx.DNSLookupOptionIDGenerator(m.idGen),
 		dslx.DNSLookupOptionLogger(logger),
-		dslx.DNSLookupOptionZeroTime(zeroTime),
+		dslx.DNSLookupOptionZeroTime(m.zeroTime),
 	)
 	// construct getaddrinfo resolver
 	lookup := dslx.DNSLookupGetaddrinfo()
@@ -257,9 +259,9 @@ func measureTarget(
 		dslx.EndpointNetwork("tcp"),
 		dslx.EndpointPort(443),
 		dslx.EndpointOptionDomain(domain),
-		dslx.EndpointOptionIDGenerator(idGen),
+		dslx.EndpointOptionIDGenerator(m.idGen),
 		dslx.EndpointOptionLogger(logger),
-		dslx.EndpointOptionZeroTime(zeroTime),
+		dslx.EndpointOptionZeroTime(m.zeroTime),
 	)
 
 	// count the number of successful GET requests
