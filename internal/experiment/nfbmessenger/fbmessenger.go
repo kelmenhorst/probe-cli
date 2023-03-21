@@ -180,8 +180,7 @@ type Measurer struct {
 	// will be using default settings.
 	Config Config
 
-	idGen    atomic.Int64
-	zeroTime time.Time
+	idGen atomic.Int64
 }
 
 // ExperimentName implements ExperimentMeasurer.ExperimentName
@@ -197,6 +196,7 @@ func (m Measurer) ExperimentVersion() string {
 func (m Measurer) measureTarget(
 	ctx context.Context,
 	sess model.ExperimentSession,
+	zeroTime time.Time,
 	tk *TestKeys,
 	domain string,
 	wg *sync.WaitGroup,
@@ -208,7 +208,7 @@ func (m Measurer) measureTarget(
 		dslx.DomainName(domain),
 		dslx.DNSLookupOptionIDGenerator(&m.idGen),
 		dslx.DNSLookupOptionLogger(sess.Logger()),
-		dslx.DNSLookupOptionZeroTime(m.zeroTime),
+		dslx.DNSLookupOptionZeroTime(zeroTime),
 	)
 	// construct getaddrinfo resolver
 	lookup := dslx.DNSLookupGetaddrinfo()
@@ -237,7 +237,7 @@ func (m Measurer) measureTarget(
 		dslx.EndpointOptionDomain(domain),
 		dslx.EndpointOptionIDGenerator(&m.idGen),
 		dslx.EndpointOptionLogger(sess.Logger()),
-		dslx.EndpointOptionZeroTime(m.zeroTime),
+		dslx.EndpointOptionZeroTime(zeroTime),
 	)
 
 	// count the number of successful TCP Connects per domain
@@ -281,7 +281,6 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	tk := new(TestKeys)
 	measurement.TestKeys = tk
 	tk.Agent = "redirect"
-	m.zeroTime = time.Now()
 	m.idGen = atomic.Int64{}
 
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -297,7 +296,7 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	wg := sync.WaitGroup{}
 	for _, service := range services {
 		wg.Add(1)
-		go m.measureTarget(ctx, args.Session, tk, service, &wg)
+		go m.measureTarget(ctx, args.Session, measurement.MeasurementStartTimeSaved, tk, service, &wg)
 	}
 
 	wg.Wait()

@@ -165,8 +165,7 @@ type Measurer struct {
 	// will be using default settings.
 	Config Config
 
-	idGen    *atomic.Int64
-	zeroTime time.Time
+	idGen *atomic.Int64
 }
 
 // ExperimentName implements ExperimentMeasurer.ExperimentName
@@ -181,7 +180,6 @@ func (m Measurer) ExperimentVersion() string {
 
 // Run implements ExperimentMeasurer.Run
 func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
-	m.zeroTime = time.Now()
 	m.idGen = &atomic.Int64{}
 	sess := args.Session
 	measurement := args.Measurement
@@ -207,7 +205,7 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 	wg := &sync.WaitGroup{}
 	for _, domain := range domains {
 		wg.Add(1)
-		go m.measureTarget(ctx, sess.Logger(), tk, domain, certPool, wg)
+		go m.measureTarget(ctx, sess.Logger(), measurement.MeasurementStartTimeSaved, tk, domain, certPool, wg)
 	}
 	wg.Wait()
 
@@ -218,6 +216,7 @@ func (m Measurer) Run(ctx context.Context, args *model.ExperimentArgs) error {
 func (m *Measurer) measureTarget(
 	ctx context.Context,
 	logger model.Logger,
+	zeroTime time.Time,
 	tk *TestKeys,
 	domain string,
 	certPool *x509.CertPool,
@@ -230,7 +229,7 @@ func (m *Measurer) measureTarget(
 		dslx.DomainName(domain),
 		dslx.DNSLookupOptionIDGenerator(m.idGen),
 		dslx.DNSLookupOptionLogger(logger),
-		dslx.DNSLookupOptionZeroTime(m.zeroTime),
+		dslx.DNSLookupOptionZeroTime(zeroTime),
 	)
 	// construct getaddrinfo resolver
 	lookup := dslx.DNSLookupGetaddrinfo()
@@ -261,7 +260,7 @@ func (m *Measurer) measureTarget(
 		dslx.EndpointOptionDomain(domain),
 		dslx.EndpointOptionIDGenerator(m.idGen),
 		dslx.EndpointOptionLogger(logger),
-		dslx.EndpointOptionZeroTime(m.zeroTime),
+		dslx.EndpointOptionZeroTime(zeroTime),
 	)
 
 	// count the number of successful GET requests
