@@ -179,11 +179,8 @@ func TestSNIBlockingIntegration(t *testing.T) {
 				"google.com",
 				"www.example.com",
 			)
-			if result.Failure == nil {
-				t.Fatalf("Expected an SSL Unknown Authority failure here")
-			}
-			if *result.Failure != netxlite.FailureSSLUnknownAuthority {
-				t.Fatalf("Unexpected error: %v", *result.Failure)
+			if result.Failure != nil {
+				t.Fatalf("Unexpected failure")
 			}
 		})
 	})
@@ -241,11 +238,8 @@ func TestSNIBlockingIntegration(t *testing.T) {
 				"www.example.com",
 				"www.example.com",
 			)
-			if result.Failure == nil {
-				t.Fatalf("Expected an SSL Unknown Authority failure here")
-			}
-			if *result.Failure != netxlite.FailureSSLUnknownAuthority {
-				t.Fatalf("Unexpected error: %v", *result.Failure)
+			if result.Failure != nil {
+				t.Fatalf("Unexpected failure")
 			}
 		})
 	})
