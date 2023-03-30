@@ -46,9 +46,15 @@ func NewEnvironment() *Environment {
 	// note: because the stack is created using topology.AddHost, we don't
 	// need to call Close when done using it, since the topology will do that
 	// for us when we call the topology's Close method.
-	serverStack := runtimex.Try1(topology.AddHost(
+	dnsServerStack := runtimex.Try1(topology.AddHost(
 		"1.2.3.4", // server IP address
-		"1.2.3.4", // default resolver address
+		"0.0.0.0", // default resolver address
+		&netem.LinkConfig{},
+	))
+
+	httpsServerStack := runtimex.Try1(topology.AddHost(
+		"9.9.9.9", // server IP address
+		"0.0.0.0", // default resolver address
 		&netem.LinkConfig{},
 	))
 
@@ -57,25 +63,25 @@ func NewEnvironment() *Environment {
 	dnsConfig.AddRecord(
 		"www.example.com",
 		"example.com", // CNAME
-		"1.2.3.4",
+		"9.9.9.9",
 	)
 
-	// create DNS server using the serverStack
+	// create DNS server using the dnsServerStack
 	dnsServer := runtimex.Try1(netem.NewDNSServer(
 		model.DiscardLogger,
-		serverStack,
+		dnsServerStack,
 		"1.2.3.4",
 		dnsConfig,
 	))
 
-	// create HTTPS server using the serverStack
-	tlsListener := runtimex.Try1(serverStack.ListenTCP("tcp", &net.TCPAddr{
-		IP:   net.IPv4(1, 2, 3, 4),
+	// create HTTPS server using the httpsServerStack
+	tlsListener := runtimex.Try1(httpsServerStack.ListenTCP("tcp", &net.TCPAddr{
+		IP:   net.IPv4(9, 9, 9, 9),
 		Port: 443,
 		Zone: "",
 	}))
 	httpsServer := &http.Server{
-		TLSConfig: serverStack.ServerTLSConfig(),
+		TLSConfig: httpsServerStack.ServerTLSConfig(),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`hello, world`))
 		}),
@@ -132,8 +138,39 @@ func newsession() model.ExperimentSession {
 	return &mockable.Session{MockableLogger: log.Log}
 }
 
-func TestSNIBlockingIntegration(t *testing.T) {
-	t.Run("Test Measurer.Run", func(t *testing.T) {
+func TestIntegrationMeasurer(t *testing.T) {
+	t.Run("Test Measurer with cancelled context", func(t *testing.T) {
+		env := NewEnvironment()
+		defer env.Close()
+		env.Do(func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // immediately cancel the context
+			measurer := NewExperimentMeasurer(Config{
+				ControlSNI: "example.com",
+			})
+			measurement := &model.Measurement{
+				Input: "kernel.org",
+			}
+			args := &model.ExperimentArgs{
+				Callbacks:   model.NewPrinterCallbacks(log.Log),
+				Measurement: measurement,
+				Session:     newsession(),
+			}
+			err := measurer.Run(ctx, args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sk, err := measurer.GetSummaryKeys(measurement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := sk.(SummaryKeys); !ok {
+				t.Fatal("invalid type for summary keys")
+			}
+		})
+	})
+
+	t.Run("Test Measurer without DPI", func(t *testing.T) {
 		env := NewEnvironment()
 		defer env.Close()
 		env.Do(func() {
@@ -152,24 +189,60 @@ func TestSNIBlockingIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error: %s", err)
 			}
-			sk, err := measurer.GetSummaryKeys(measurement)
-			if err != nil {
-				t.Fatal(err)
+			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Control.Failure != nil {
+				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
 			}
-			if _, ok := sk.(SummaryKeys); !ok {
-				t.Fatal("invalid type for summary keys")
+			if tk.Target.Failure != nil {
+				t.Fatalf("Unexpected Target Failure %s", *tk.Target.Failure)
 			}
 		})
 	})
 
-	t.Run("Test target without DPI", func(t *testing.T) {
+	t.Run("Test Measurer with DPI that blocks target SNI", func(t *testing.T) {
+		env := NewEnvironment()
+		defer env.Close()
+		dpi := env.DPIEngine()
+		dpi.AddRule(&netem.DPIResetTrafficForTLSSNI{
+			Logger: model.DiscardLogger,
+			SNI:    "google.com",
+		})
+		env.Do(func() {
+			measurer := NewExperimentMeasurer(Config{
+				ControlSNI: "www.example.com",
+			})
+			measurement := &model.Measurement{
+				Input: "google.com",
+			}
+			args := &model.ExperimentArgs{
+				Callbacks:   model.NewPrinterCallbacks(log.Log),
+				Measurement: measurement,
+				Session:     newsession(),
+			}
+			err := measurer.Run(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Control.Failure != nil {
+				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
+			}
+			if tk.Target.Failure == nil {
+				t.Fatalf("Expected a Target Failure, but got none")
+			}
+		})
+	})
+}
+
+func TestIntegrationMeasureOne(t *testing.T) {
+	t.Run("Test measureone target without DPI", func(t *testing.T) {
 		env := NewEnvironment()
 		defer env.Close()
 		env.Do(func() {
 			ctx, _ := context.WithCancel(context.Background())
 			measurer := new(Measurer)
 			var m = map[string]bool{
-				"1.2.3.4": true,
+				"9.9.9.9": true,
 			}
 			measurer.thAddrs = &dslx.AddressSet{M: m}
 			result := measurer.measureone(
@@ -185,7 +258,7 @@ func TestSNIBlockingIntegration(t *testing.T) {
 		})
 	})
 
-	t.Run("Test target with SNI blocking DPI", func(t *testing.T) {
+	t.Run("Test measureone target with SNI blocking DPI", func(t *testing.T) {
 		env := NewEnvironment()
 		defer env.Close()
 		dpi := env.DPIEngine()
@@ -197,7 +270,7 @@ func TestSNIBlockingIntegration(t *testing.T) {
 			ctx, _ := context.WithCancel(context.Background())
 			measurer := new(Measurer)
 			var m = map[string]bool{
-				"1.2.3.4": true,
+				"9.9.9.9": true,
 			}
 			measurer.thAddrs = &dslx.AddressSet{M: m}
 			result := measurer.measureone(
@@ -216,7 +289,7 @@ func TestSNIBlockingIntegration(t *testing.T) {
 		})
 	})
 
-	t.Run("Test control with SNI blocking DPI", func(t *testing.T) {
+	t.Run("Test measureone control with SNI blocking DPI", func(t *testing.T) {
 		env := NewEnvironment()
 		defer env.Close()
 		dpi := env.DPIEngine()
@@ -228,7 +301,7 @@ func TestSNIBlockingIntegration(t *testing.T) {
 			ctx, _ := context.WithCancel(context.Background())
 			measurer := new(Measurer)
 			var m = map[string]bool{
-				"1.2.3.4": true,
+				"9.9.9.9": true,
 			}
 			measurer.thAddrs = &dslx.AddressSet{M: m}
 			result := measurer.measureone(
@@ -349,9 +422,10 @@ func TestMeasurerMeasureNoMeasurementInput(t *testing.T) {
 	measurer := NewExperimentMeasurer(Config{
 		ControlSNI: "example.com",
 	})
+	measurement := &model.Measurement{}
 	args := &model.ExperimentArgs{
 		Callbacks:   model.NewPrinterCallbacks(log.Log),
-		Measurement: &model.Measurement{},
+		Measurement: measurement,
 		Session:     newsession(),
 	}
 	err := measurer.Run(context.Background(), args)
