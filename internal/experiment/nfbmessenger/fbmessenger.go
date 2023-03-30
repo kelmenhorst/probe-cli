@@ -147,8 +147,7 @@ func (tk *TestKeys) computeDNSStatus(dnsStatus **bool, r *dslx.Maybe[*dslx.Resol
 		*dnsStatus = &falseValue
 		return
 	}
-	obs := dslx.ExtractObservations(r)
-	for _, o := range obs {
+	for _, o := range r.Observations {
 		for _, query := range (*o).Queries {
 			for _, ans := range query.Answers {
 				if ans.ASN != FacebookASN && ans.AnswerType != "CNAME" {
