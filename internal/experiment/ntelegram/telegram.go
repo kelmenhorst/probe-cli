@@ -112,6 +112,15 @@ func (m Measurer) ExperimentVersion() string {
 	return testVersion
 }
 
+var datacenters = []string{
+	"149.154.175.50",
+	"149.154.167.51",
+	"149.154.175.100",
+	"149.154.167.91",
+	"149.154.171.5",
+	"95.161.76.100",
+}
+
 // measureDC measures telegram datacenter endpoints by issuing HTTP POST requests
 // and calls wg.Done() upon return.
 func measureDC(
@@ -125,14 +134,8 @@ func measureDC(
 	defer wg.Done()
 
 	// ipAddrs contains the DCs IP addresses
-	var ipAddrs = dslx.NewAddressSet().Add(
-		"149.154.175.50",
-		"149.154.167.51",
-		"149.154.175.100",
-		"149.154.167.91",
-		"149.154.171.5",
-		"95.161.76.100",
-	)
+	var ipAddrs = dslx.NewAddressSet().Add(datacenters...)
+
 	// construct the list of endpoints to measure: we need to
 	// measure each IP address with port 80 and 443
 	var (
