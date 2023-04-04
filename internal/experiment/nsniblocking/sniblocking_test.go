@@ -5,17 +5,17 @@ import (
 	"net"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/apex/log"
 	"github.com/ooni/netem"
-	"github.com/ooni/probe-cli/v3/internal/dslx"
 	"github.com/ooni/probe-cli/v3/internal/legacy/mockable"
 	"github.com/ooni/probe-cli/v3/internal/model"
 	"github.com/ooni/probe-cli/v3/internal/netemx"
 	"github.com/ooni/probe-cli/v3/internal/netxlite"
 	"github.com/ooni/probe-cli/v3/internal/runtimex"
 )
+
+// The netemx environment design is based on netemx_test.
 
 // Environment is the [netem] QA environment we use in this package.
 type Environment struct {
@@ -37,9 +37,14 @@ type Environment struct {
 
 // NewEnvironment creates a new QA environment. This function
 // calls [runtimex.PanicOnError] in case of failure.
-func NewEnvironment() *Environment {
+func NewEnvironment(altResolver string) *Environment {
 	// create a new star topology
 	topology := runtimex.Try1(netem.NewStarTopology(model.DiscardLogger))
+	defaultResolver := "1.2.3.4"
+	resolverAddr := defaultResolver
+	if altResolver != "" {
+		resolverAddr = altResolver
+	}
 
 	// create server stack
 	//
@@ -47,22 +52,16 @@ func NewEnvironment() *Environment {
 	// need to call Close when done using it, since the topology will do that
 	// for us when we call the topology's Close method.
 	dnsServerStack := runtimex.Try1(topology.AddHost(
-		"1.2.3.4", // server IP address
-		"0.0.0.0", // default resolver address
-		&netem.LinkConfig{},
-	))
-
-	httpsServerStack := runtimex.Try1(topology.AddHost(
-		"9.9.9.9", // server IP address
-		"0.0.0.0", // default resolver address
+		resolverAddr,    // server IP address
+		defaultResolver, // default resolver address
 		&netem.LinkConfig{},
 	))
 
 	// create configuration for DNS server
 	dnsConfig := netem.NewDNSConfig()
 	dnsConfig.AddRecord(
-		"www.example.com",
-		"example.com", // CNAME
+		"example.org",
+		"example.org", // CNAME
 		"9.9.9.9",
 	)
 
@@ -70,18 +69,24 @@ func NewEnvironment() *Environment {
 	dnsServer := runtimex.Try1(netem.NewDNSServer(
 		model.DiscardLogger,
 		dnsServerStack,
-		"1.2.3.4",
+		resolverAddr,
 		dnsConfig,
 	))
 
-	// create HTTPS server using the httpsServerStack
-	tlsListener := runtimex.Try1(httpsServerStack.ListenTCP("tcp", &net.TCPAddr{
+	serverStack := runtimex.Try1(topology.AddHost(
+		"9.9.9.9",       // server IP address
+		defaultResolver, // default resolver address
+		&netem.LinkConfig{},
+	))
+
+	// create HTTPS server using the server stack
+	tlsListener := runtimex.Try1(serverStack.ListenTCP("tcp", &net.TCPAddr{
 		IP:   net.IPv4(9, 9, 9, 9),
 		Port: 443,
 		Zone: "",
 	}))
 	httpsServer := &http.Server{
-		TLSConfig: httpsServerStack.ServerTLSConfig(),
+		TLSConfig: serverStack.ServerTLSConfig(),
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`hello, world`))
 		}),
@@ -97,8 +102,8 @@ func NewEnvironment() *Environment {
 	// need to call Close when done using it, since the topology will do that
 	// for us when we call the topology's Close method.
 	clientStack := runtimex.Try1(topology.AddHost(
-		"10.0.0.14", // client IP address
-		"1.2.3.4",   // default resolver address
+		"10.0.0.14",     // client IP address
+		defaultResolver, // default resolver address
 		&netem.LinkConfig{
 			DPIEngine: dpi,
 		},
@@ -139,43 +144,12 @@ func newsession() model.ExperimentSession {
 }
 
 func TestIntegrationMeasurer(t *testing.T) {
-	t.Run("Test Measurer with cancelled context", func(t *testing.T) {
-		env := NewEnvironment()
-		defer env.Close()
-		env.Do(func() {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel() // immediately cancel the context
-			measurer := NewExperimentMeasurer(Config{
-				ControlSNI: "example.com",
-			})
-			measurement := &model.Measurement{
-				Input: "kernel.org",
-			}
-			args := &model.ExperimentArgs{
-				Callbacks:   model.NewPrinterCallbacks(log.Log),
-				Measurement: measurement,
-				Session:     newsession(),
-			}
-			err := measurer.Run(ctx, args)
-			if err != nil {
-				t.Fatal(err)
-			}
-			sk, err := measurer.GetSummaryKeys(measurement)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, ok := sk.(SummaryKeys); !ok {
-				t.Fatal("invalid type for summary keys")
-			}
-		})
-	})
-
-	t.Run("Test Measurer without DPI", func(t *testing.T) {
-		env := NewEnvironment()
+	t.Run("Test Measurer without DPI: expect success", func(t *testing.T) {
+		env := NewEnvironment("")
 		defer env.Close()
 		env.Do(func() {
 			measurer := NewExperimentMeasurer(Config{
-				ControlSNI: "www.example.com",
+				ControlSNI: "example.org",
 			})
 			measurement := &model.Measurement{
 				Input: "google.com",
@@ -190,6 +164,116 @@ func TestIntegrationMeasurer(t *testing.T) {
 				t.Fatalf("Unexpected error: %s", err)
 			}
 			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Result != classSuccessGotServerHello {
+				t.Fatalf("Unexpected result, expected: %s, got: %s", classSuccessGotServerHello, tk.Result)
+			}
+			if tk.Control.Failure != nil {
+				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
+			}
+			if tk.Target.Failure != nil {
+				t.Fatalf("Unexpected Target Failure %s", *tk.Target.Failure)
+			}
+		})
+	})
+
+	t.Run("Test Measurer with cancelled context: expect valid type of summary keys", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // immediately cancel the context
+		measurer := NewExperimentMeasurer(Config{})
+		measurement := &model.Measurement{
+			Input: "kernel.org",
+		}
+		args := &model.ExperimentArgs{
+			Callbacks:   model.NewPrinterCallbacks(log.Log),
+			Measurement: measurement,
+			Session:     newsession(),
+		}
+		err := measurer.Run(ctx, args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tk := measurement.TestKeys.(*TestKeys)
+		if tk.Result != classAnomalyTestHelperUnreachable {
+			t.Fatalf("Unexpected result, expected: %s, got: %s", classAnomalyTestHelperUnreachable, tk.Result)
+		}
+		sk, err := measurer.GetSummaryKeys(measurement)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := sk.(SummaryKeys); !ok {
+			t.Fatal("invalid type for summary keys")
+		}
+	})
+
+	t.Run("Test Measurer with cached entry: expect interrupted failure", func(t *testing.T) {
+		env := NewEnvironment("")
+		defer env.Close()
+		env.Do(func() {
+			cache := make(map[string]Subresult)
+			s := netxlite.FailureInterrupted
+			testsni := "google.com"
+			thaddr := "example.org:443"
+			cache[testsni+thaddr] = Subresult{
+				Failure:   &s,
+				THAddress: thaddr,
+				SNI:       testsni,
+			}
+			measurer := NewExperimentMeasurer(Config{
+				ControlSNI: "example.org",
+			})
+			measurer.(*Measurer).cache = cache
+			measurement := &model.Measurement{
+				Input: model.MeasurementTarget(testsni),
+			}
+			args := &model.ExperimentArgs{
+				Callbacks:   model.NewPrinterCallbacks(log.Log),
+				Measurement: measurement,
+				Session:     newsession(),
+			}
+			err := measurer.Run(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Result != classAnomalyUnexpectedFailure {
+				t.Fatalf("Unexpected result, expected: %s, got: %s", classAnomalyUnexpectedFailure, tk.Result)
+			}
+			if tk.Control.Failure != nil {
+				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
+			}
+			if tk.Target.Failure == nil {
+				t.Fatalf("Expected Target Failure but got none")
+			}
+			if *tk.Target.Failure != netxlite.FailureInterrupted {
+				t.Fatalf("Unexpected Target Failure, expected: %s, got: %s", netxlite.FailureInterrupted, *tk.Target.Failure)
+			}
+		})
+	})
+
+	t.Run("Test Measurer with alternative UDP resolver, without DPI: expect success", func(t *testing.T) {
+		env := NewEnvironment("1.1.1.1")
+		defer env.Close()
+		env.Do(func() {
+			measurer := NewExperimentMeasurer(Config{
+				ControlSNI:  "example.org",
+				ResolverURL: "1.1.1.1:53",
+			})
+			measurement := &model.Measurement{
+				Input: "google.com",
+			}
+			args := &model.ExperimentArgs{
+				Callbacks:   model.NewPrinterCallbacks(log.Log),
+				Measurement: measurement,
+				Session:     newsession(),
+			}
+			err := measurer.Run(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Result != classSuccessGotServerHello {
+				t.Fatalf("Unexpected result, expected: %s, got: %s", classSuccessGotServerHello, tk.Result)
+			}
 			if tk.Control.Failure != nil {
 				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
 			}
@@ -200,7 +284,7 @@ func TestIntegrationMeasurer(t *testing.T) {
 	})
 
 	t.Run("Test Measurer with DPI that blocks target SNI", func(t *testing.T) {
-		env := NewEnvironment()
+		env := NewEnvironment("")
 		defer env.Close()
 		dpi := env.DPIEngine()
 		dpi.AddRule(&netem.DPIResetTrafficForTLSSNI{
@@ -209,7 +293,7 @@ func TestIntegrationMeasurer(t *testing.T) {
 		})
 		env.Do(func() {
 			measurer := NewExperimentMeasurer(Config{
-				ControlSNI: "www.example.com",
+				ControlSNI: "example.org",
 			})
 			measurement := &model.Measurement{
 				Input: "google.com",
@@ -224,95 +308,17 @@ func TestIntegrationMeasurer(t *testing.T) {
 				t.Fatalf("Unexpected error: %s", err)
 			}
 			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.Result != classInterferenceReset {
+				t.Fatalf("Unexpected result, expected: %s, got: %s", classInterferenceReset, tk.Result)
+			}
 			if tk.Control.Failure != nil {
 				t.Fatalf("Unexpected Control Failure %s", *tk.Control.Failure)
 			}
 			if tk.Target.Failure == nil {
 				t.Fatalf("Expected a Target Failure, but got none")
 			}
-		})
-	})
-}
-
-func TestIntegrationMeasureOne(t *testing.T) {
-	t.Run("Test measureone target without DPI", func(t *testing.T) {
-		env := NewEnvironment()
-		defer env.Close()
-		env.Do(func() {
-			ctx, _ := context.WithCancel(context.Background())
-			measurer := new(Measurer)
-			var m = map[string]bool{
-				"9.9.9.9": true,
-			}
-			measurer.thAddrs = &dslx.AddressSet{M: m}
-			result := measurer.measureone(
-				ctx,
-				&mockable.Session{MockableLogger: log.Log},
-				time.Now(),
-				"google.com",
-				"www.example.com",
-			)
-			if result.Failure != nil {
-				t.Fatalf("Unexpected failure")
-			}
-		})
-	})
-
-	t.Run("Test measureone target with SNI blocking DPI", func(t *testing.T) {
-		env := NewEnvironment()
-		defer env.Close()
-		dpi := env.DPIEngine()
-		dpi.AddRule(&netem.DPIResetTrafficForTLSSNI{
-			Logger: model.DiscardLogger,
-			SNI:    "google.com",
-		})
-		env.Do(func() {
-			ctx, _ := context.WithCancel(context.Background())
-			measurer := new(Measurer)
-			var m = map[string]bool{
-				"9.9.9.9": true,
-			}
-			measurer.thAddrs = &dslx.AddressSet{M: m}
-			result := measurer.measureone(
-				ctx,
-				&mockable.Session{MockableLogger: log.Log},
-				time.Now(),
-				"google.com",
-				"www.example.com",
-			)
-			if result.Failure == nil {
-				t.Fatalf("Expected an error here")
-			}
-			if *result.Failure != netxlite.FailureConnectionReset {
-				t.Fatalf("Unexpected error: %v", *result.Failure)
-			}
-		})
-	})
-
-	t.Run("Test measureone control with SNI blocking DPI", func(t *testing.T) {
-		env := NewEnvironment()
-		defer env.Close()
-		dpi := env.DPIEngine()
-		dpi.AddRule(&netem.DPIResetTrafficForTLSSNI{
-			Logger: model.DiscardLogger,
-			SNI:    "google.com",
-		})
-		env.Do(func() {
-			ctx, _ := context.WithCancel(context.Background())
-			measurer := new(Measurer)
-			var m = map[string]bool{
-				"9.9.9.9": true,
-			}
-			measurer.thAddrs = &dslx.AddressSet{M: m}
-			result := measurer.measureone(
-				ctx,
-				&mockable.Session{MockableLogger: log.Log},
-				time.Now(),
-				"www.example.com",
-				"www.example.com",
-			)
-			if result.Failure != nil {
-				t.Fatalf("Unexpected failure")
+			if *tk.Target.Failure != netxlite.FailureConnectionReset {
+				t.Fatalf("Unexpected Target Failure, got: %s, expected: %s", *tk.Target.Failure, netxlite.FailureConnectionReset)
 			}
 		})
 	})
@@ -420,7 +426,7 @@ func TestNewExperimentMeasurer(t *testing.T) {
 
 func TestMeasurerMeasureNoMeasurementInput(t *testing.T) {
 	measurer := NewExperimentMeasurer(Config{
-		ControlSNI: "example.com",
+		ControlSNI: "example.org",
 	})
 	measurement := &model.Measurement{}
 	args := &model.ExperimentArgs{
@@ -438,7 +444,7 @@ func TestMeasurerMeasureWithInvalidInput(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // immediately cancel the context
 	measurer := NewExperimentMeasurer(Config{
-		ControlSNI: "example.com",
+		ControlSNI: "example.org",
 	})
 	measurement := &model.Measurement{
 		Input: "\t",
@@ -451,5 +457,29 @@ func TestMeasurerMeasureWithInvalidInput(t *testing.T) {
 	err := measurer.Run(ctx, args)
 	if err == nil {
 		t.Fatal("expected an error here")
+	}
+}
+
+func TestMaybeURLToSNI(t *testing.T) {
+	r, err := maybeURLToSNI(model.MeasurementTarget("\t"))
+	if err == nil {
+		t.Fatal("Expected an error here")
+	}
+	if r != "" {
+		t.Fatalf("Unexpected non-empty SNI: %s", r)
+	}
+	r, err = maybeURLToSNI("google.com")
+	if r != "google.com" {
+		t.Fatalf("Unexpected SNI, expected: %s, got %s", "google.com", r)
+	}
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	r, err = maybeURLToSNI(model.MeasurementTarget("https://google.com"))
+	if r != "google.com" {
+		t.Fatalf("Unexpected SNI, expected: %s, got %s", "google.com", r)
+	}
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
 	}
 }
