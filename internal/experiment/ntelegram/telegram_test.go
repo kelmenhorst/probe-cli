@@ -15,6 +15,8 @@ import (
 	"github.com/ooni/probe-cli/v3/internal/runtimex"
 )
 
+// The netemx environment design is based on netemx_test.
+
 // Environment is the [netem] QA environment we use in this package.
 type Environment struct {
 	// clientStack is the client stack to use.
@@ -35,7 +37,7 @@ type Environment struct {
 
 // NewEnvironment creates a new QA environment. This function
 // calls [runtimex.PanicOnError] in case of failure.
-func NewEnvironment() *Environment {
+func NewEnvironment(dnsConfig *netem.DNSConfig) *Environment {
 	e := &Environment{}
 
 	// create a new star topology
@@ -52,14 +54,15 @@ func NewEnvironment() *Environment {
 		&netem.LinkConfig{},
 	))
 
-	// web
-	// create configuration for DNS server
-	dnsConfig := netem.NewDNSConfig()
-	dnsConfig.AddRecord(
-		"web.telegram.org",
-		"web.telegram.org", // CNAME
-		"9.9.9.9",
-	)
+	if dnsConfig == nil {
+		// create configuration for DNS server
+		dnsConfig = netem.NewDNSConfig()
+		dnsConfig.AddRecord(
+			"web.telegram.org",
+			"web.telegram.org", // CNAME
+			"149.154.167.99",
+		)
+	}
 
 	// create DNS server using the dnsServerStack
 	e.dnsServer = runtimex.Try1(netem.NewDNSServer(
@@ -69,15 +72,16 @@ func NewEnvironment() *Environment {
 		dnsConfig,
 	))
 
+	// create the Telegram Web server stack
 	webServerStack := runtimex.Try1(e.topology.AddHost(
-		"9.9.9.9", // server IP address
-		"0.0.0.0", // default resolver address
+		"149.154.167.99", // server IP address
+		"0.0.0.0",        // default resolver address
 		&netem.LinkConfig{},
 	))
 
-	// create HTTPS server using the httpsServerStack
+	// create HTTPS server instance on port 443 at the webServerStack
 	webListener := runtimex.Try1(webServerStack.ListenTCP("tcp", &net.TCPAddr{
-		IP:   net.IPv4(9, 9, 9, 9),
+		IP:   net.IPv4(149, 154, 167, 99),
 		Port: 443,
 		Zone: "",
 	}))
@@ -88,17 +92,18 @@ func NewEnvironment() *Environment {
 		}),
 	}
 	e.httpsServers = append(e.httpsServers, webServer)
+	// run Telegram Web server
 	go webServer.ServeTLS(webListener, "", "")
 
-	// create all server stacks
 	for _, dc := range datacenters {
+		// for each telegram endpoint, we create a server stack
 		httpServerStack := runtimex.Try1(e.topology.AddHost(
 			dc,        // server IP address
 			"0.0.0.0", // default resolver address
 			&netem.LinkConfig{},
 		))
+		// on each server stack we create two TCP servers -- on port 443 and 80
 		for _, port := range []int{443, 80} {
-			// create HTTP servers using the httpsServerStack
 			tcpListener := runtimex.Try1(httpServerStack.ListenTCP("tcp", &net.TCPAddr{
 				IP:   net.ParseIP(dc),
 				Port: port,
@@ -110,6 +115,7 @@ func NewEnvironment() *Environment {
 				}),
 			}
 			e.httpsServers = append(e.httpsServers, httpServer)
+			// run TCP server
 			go httpServer.Serve(tcpListener)
 		}
 	}
@@ -160,9 +166,29 @@ func newsession() model.ExperimentSession {
 	return &mockable.Session{MockableLogger: log.Log}
 }
 
+func TestNewExperimentMeasurer(t *testing.T) {
+	measurer := NewExperimentMeasurer(Config{})
+	if measurer.ExperimentName() != "ntelegram" {
+		t.Fatal("unexpected name")
+	}
+	if measurer.ExperimentVersion() != "0.1.0" {
+		t.Fatal("unexpected version")
+	}
+}
+
+func TestSummaryKeysInvalidType(t *testing.T) {
+	measurement := new(model.Measurement)
+	m := &Measurer{}
+	_, err := m.GetSummaryKeys(measurement)
+	if err.Error() != "invalid test keys type" {
+		t.Fatal("not the error we expected")
+	}
+}
+
 func TestIntegrationMeasurer(t *testing.T) {
-	t.Run("Test Measurer without DPI", func(t *testing.T) {
-		env := NewEnvironment()
+	t.Run("Test Measurer without DPI: expect success", func(t *testing.T) {
+		// create a new test environment
+		env := NewEnvironment(nil)
 		defer env.Close()
 		env.Do(func() {
 			measurer := NewExperimentMeasurer(Config{})
@@ -178,7 +204,7 @@ func TestIntegrationMeasurer(t *testing.T) {
 			}
 			tk, _ := (measurement.TestKeys).(*TestKeys)
 			if tk.TelegramWebFailure != nil {
-				t.Fatalf("Unexpected Web failure %s", *tk.TelegramWebFailure)
+				t.Fatalf("Unexpected Telegram Web failure %s", *tk.TelegramWebFailure)
 			}
 			if tk.TelegramHTTPBlocking {
 				t.Fatalf("Unexpected HTTP blocking")
@@ -186,18 +212,61 @@ func TestIntegrationMeasurer(t *testing.T) {
 			if tk.TelegramTCPBlocking {
 				t.Fatal("Unexpected TCP blocking")
 			}
+			sk, err := measurer.GetSummaryKeys(measurement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := sk.(SummaryKeys); !ok {
+				t.Fatal("invalid type for summary keys")
+			}
 		})
 	})
 
-	t.Run("Test Measurer with DPI that drops TCP traffic towards telegram endpoint", func(t *testing.T) {
+	t.Run("Test Measurer with poisoned DNS: expect TelegramWebFailure", func(t *testing.T) {
+		// create a new test environment with bogon DNS
+		dnsConfig := netem.NewDNSConfig()
+		dnsConfig.AddRecord(
+			"web.telegram.org",
+			"web.telegram.org", // CNAME
+			"a.b.c.d",          // bogon
+		)
+		env := NewEnvironment(dnsConfig)
+		defer env.Close()
+		env.Do(func() {
+			measurer := NewExperimentMeasurer(Config{})
+			measurement := &model.Measurement{}
+			args := &model.ExperimentArgs{
+				Callbacks:   model.NewPrinterCallbacks(log.Log),
+				Measurement: measurement,
+				Session:     newsession(),
+			}
+			err := measurer.Run(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+			tk, _ := (measurement.TestKeys).(*TestKeys)
+			if tk.TelegramWebFailure == nil {
+				t.Fatalf("Expected Web Failure but got none")
+			}
+			if tk.TelegramHTTPBlocking {
+				t.Fatal("Unexpected HTTP blocking")
+			}
+			if tk.TelegramTCPBlocking {
+				t.Fatal("Unexpected TCP blocking")
+			}
+		})
+	})
+
+	t.Run("Test Measurer with DPI that drops TCP traffic towards telegram endpoint: expect Telegram(HTTP|TCP)Blocking", func(t *testing.T) {
 		// overwrite global datacenters, otherwise the test times out because there are too many endpoints
 		orig := datacenters
 		datacenters = []string{
 			"149.154.175.50",
 		}
-
-		env := NewEnvironment()
+		// create a new test environment
+		env := NewEnvironment(nil)
 		defer env.Close()
+		// create DPI that drops traffic for datacenter endpoints on ports 443 and 80
 		dpi := env.DPIEngine()
 		for _, dc := range datacenters {
 			dpi.AddRule(&netem.DPIDropTrafficForServerEndpoint{
@@ -227,7 +296,7 @@ func TestIntegrationMeasurer(t *testing.T) {
 			}
 			tk, _ := (measurement.TestKeys).(*TestKeys)
 			if tk.TelegramWebFailure != nil {
-				t.Fatalf("Unexpected Web failure %s", *tk.TelegramWebFailure)
+				t.Fatalf("Unexpected Telegram Web failure %s", *tk.TelegramWebFailure)
 			}
 			if !tk.TelegramHTTPBlocking {
 				t.Fatal("Expected HTTP blocking but got none")
@@ -239,9 +308,11 @@ func TestIntegrationMeasurer(t *testing.T) {
 		datacenters = orig
 	})
 
-	t.Run("Test Measurer with DPI that drops TLS traffic towards telegram Web endpoint", func(t *testing.T) {
-		env := NewEnvironment()
+	t.Run("Test Measurer with DPI that drops TLS traffic with SNI = web.telegram.org: expect TelegramWebFailure", func(t *testing.T) {
+		// create a new test environment
+		env := NewEnvironment(nil)
 		defer env.Close()
+		// create DPI that drops TLS packets with SNI = web.telegram.org
 		dpi := env.DPIEngine()
 		dpi.AddRule(&netem.DPIResetTrafficForTLSSNI{
 			Logger: model.DiscardLogger,
@@ -261,7 +332,7 @@ func TestIntegrationMeasurer(t *testing.T) {
 			}
 			tk, _ := (measurement.TestKeys).(*TestKeys)
 			if tk.TelegramWebFailure == nil {
-				t.Fatalf("Expected Web failure but got none")
+				t.Fatalf("Expected Web Failure but got none")
 			}
 			if tk.TelegramHTTPBlocking {
 				t.Fatal("Unexpected HTTP blocking")
